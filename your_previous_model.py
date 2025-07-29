@@ -268,7 +268,60 @@ class EliteGolfHole:
         if self.wind_condition.speed > 5:
             wind_strength = min(self.wind_condition.speed / 30.0, 1.0)
             course_map[5, :, :] = wind_strength
-        
+
+    def export_3d_course_mesh(self):
+    """Generate 3D-compatible mesh data for visualization"""
+        grid = COURSE_GRID_SIZE
+        elevation_map = np.zeros((grid, grid))
+        terrain_map = np.zeros((grid, grid), dtype=int)  # 0=rough, 1=fairway, etc.
+
+        x_scale = self.green_distance / grid
+        y_scale = 100 / grid
+
+        # Elevation
+        elevation_value = self.elevation / 30.0  # Normalize to [-1, 1]
+        elevation_map[:, :] = elevation_value
+
+        # Fairway
+        fy1 = int((50 - self.fairway_width / 2) / y_scale)
+        fy2 = int((50 + self.fairway_width / 2) / y_scale)
+        terrain_map[:, fy1:fy2] = 1  # fairway
+
+        # Green
+        gx1 = int((self.green_distance - self.green_depth / 2) / x_scale)
+        gx2 = int((self.green_distance + self.green_depth / 2) / x_scale)
+        gy1 = int((50 - self.green_width / 2) / y_scale)
+        gy2 = int((50 + self.green_width / 2) / y_scale)
+        terrain_map[gx1:gx2, gy1:gy2] = 2  # green
+
+        # Hazards
+        for zone in self.zones + self.ob_zones + self.water_zones:
+            x1 = int(zone.get("x_start", 0) / x_scale)
+            x2 = int(zone.get("x_end", 0) / x_scale)
+            y1 = int((zone.get("y_start", 0) + 50) / y_scale)
+            y2 = int((zone.get("y_end", 0) + 50) / y_scale)
+            terrain_code = {
+                "Bunker": 3,
+                "Water": 4,
+                "OB": 5
+            }.get(zone.get("type"), 0)
+            terrain_map[x1:x2, y1:y2] = terrain_code
+
+        # Pin
+        pin_x = int(self.pin_pos[0] / x_scale)
+        pin_y = int((self.pin_pos[1] + 50) / y_scale)
+        pin_z = elevation_value
+
+        return {
+            "elevation_map": elevation_map.tolist(),
+            "terrain_map": terrain_map.tolist(),
+            "pin_position": [pin_x, pin_y, pin_z],
+            "wind": {
+                "speed": self.wind_condition.speed,
+                "direction": self.wind_condition.direction
+            }
+        }           
+            
         return course_map
 
 class ElitePlayer:
@@ -1361,3 +1414,463 @@ def determine_strategic_context(game_context, hole, distance, shot_history):
     if distance < 150 and len([c for c in shot_history if c.get('club') in wedge_names]) > 0:
         context['playing_to_strength'] = True
     else:
+        context['playing_to_strength'] = False
+    
+    return context
+
+def update_player_psychology(player, shot_result, game_context):
+    """Update player's psychological state based on shot result"""
+    # Confidence adjustment
+    if shot_result.strike_quality == "Excellent":
+        player.confidence = min(1.0, player.confidence + 0.05)
+        player.momentum = min(1.0, player.momentum + 0.1)
+    elif shot_result.strike_quality == "Normal":
+        player.confidence = min(1.0, player.confidence + 0.02)
+        player.momentum = min(1.0, player.momentum + 0.03)
+    elif shot_result.strike_quality == "Slight Mishit":
+        player.confidence = max(0.0, player.confidence - 0.02)
+        player.momentum = max(-1.0, player.momentum - 0.05)
+    else:  # Big Mishit
+        player.confidence = max(0.0, player.confidence - 0.08)
+        player.momentum = max(-1.0, player.momentum - 0.15)
+    
+    # Classification-based adjustments
+    if shot_result.classification in ["OB", "Water"]:
+        player.confidence = max(0.0, player.confidence - 0.1)
+        player.momentum = max(-1.0, player.momentum - 0.2)
+    elif shot_result.classification == "Green":
+        player.confidence = min(1.0, player.confidence + 0.03)
+        player.momentum = min(1.0, player.momentum + 0.08)
+    
+    # Pressure affects confidence decay
+    if game_context.pressure_level > 0.5:
+        player.confidence *= 0.98  # Slight decay under pressure
+
+# ====== CURRICULUM LEARNING ======
+class CurriculumManager:
+    def __init__(self):
+        self.current_level = 0
+        self.levels = [
+            {"name": "beginner", "par_range": (3, 4), "hazards": "minimal", "wind_max": 5},
+            {"name": "intermediate", "par_range": (3, 5), "hazards": "moderate", "wind_max": 12},
+            {"name": "advanced", "par_range": (3, 5), "hazards": "challenging", "wind_max": 20},
+            {"name": "tour_level", "par_range": (3, 5), "hazards": "tour", "wind_max": 30}
+        ]
+        self.performance_threshold = 0.7  # Success rate to advance
+        self.recent_performance = deque(maxlen=100)
+    
+    def get_current_level(self):
+        return self.levels[self.current_level]
+    
+    def record_performance(self, score_vs_par):
+        """Record performance and potentially advance curriculum"""
+        # Convert score to success metric (1.0 = par or better, 0.0 = very poor)
+        success = max(0.0, 1.0 - abs(score_vs_par) / 4.0)
+        self.recent_performance.append(success)
+        
+        # Check for advancement
+        if len(self.recent_performance) >= 50:
+            avg_performance = sum(self.recent_performance) / len(self.recent_performance)
+            
+            if avg_performance >= self.performance_threshold and self.current_level < len(self.levels) - 1:
+                self.current_level += 1
+                self.recent_performance.clear()
+                print(f"Advanced to curriculum level: {self.levels[self.current_level]['name']}")
+    
+    def generate_curriculum_hole(self):
+        """Generate hole appropriate for current curriculum level"""
+        level = self.get_current_level()
+        
+        if level["name"] == "beginner":
+            return self._generate_beginner_hole()
+        elif level["name"] == "intermediate":
+            return self._generate_intermediate_hole()
+        elif level["name"] == "advanced":
+            return self._generate_advanced_hole()
+        else:  # tour_level
+            return generate_elite_hole()
+    
+    def _generate_beginner_hole(self):
+        """Generate simple hole for beginners"""
+        base_distance = random.uniform(320, 380)
+        par = 4
+        fairway_width = random.uniform(35, 45)  # Wide fairways
+        green_width = random.uniform(25, 35)   # Large greens
+        green_depth = random.uniform(30, 40)
+        elevation = random.uniform(-10, 10)    # Minimal elevation
+        
+        # Simple pin position
+        pin_x = base_distance - green_depth/2 + green_depth * 0.5
+        pin_y = random.uniform(-green_width/4, green_width/4)
+        
+        # Minimal hazards
+        zones = [{
+            "type": "Fringe",
+            "x_start": base_distance - green_depth/2 - 6,
+            "x_end": base_distance + green_depth/2 + 6,
+            "y_start": -green_width/2 - 6,
+            "y_end": green_width/2 + 6
+        }]
+        
+        # One simple bunker
+        if random.random() < 0.5:
+            bunker_x = random.uniform(180, 250)
+            zones.append({
+                "type": "Bunker",
+                "x_start": bunker_x,
+                "x_end": bunker_x + 20,
+                "y_start": random.choice([-25, 20]),
+                "y_end": random.choice([-15, 30])
+            })
+        
+        wind_condition = WindCondition(random.uniform(0, 5), random.uniform(0, 360), 0)
+        
+        return EliteGolfHole(
+            length=base_distance, fairway_width=fairway_width,
+            green_distance=base_distance, green_depth=green_depth,
+            green_width=green_width, elevation=elevation,
+            zones=zones, par=par, pin_pos=(pin_x, pin_y),
+            ob_zones=[], water_zones=[], wind_condition=wind_condition
+        )
+    
+    def _generate_intermediate_hole(self):
+        """Generate moderate difficulty hole"""
+        base_distance = random.uniform(380, 450)
+        par = 4 if base_distance < 420 else 5
+        fairway_width = random.uniform(28, 38)
+        green_width = random.uniform(20, 28)
+        green_depth = random.uniform(25, 35)
+        elevation = random.uniform(-20, 20)
+        
+        # Moderate pin difficulty
+        pin_x = base_distance - green_depth/2 + green_depth * random.uniform(0.2, 0.8)
+        pin_y = random.uniform(-green_width/3, green_width/3)
+        
+        zones = []
+        
+        # 1-2 bunkers
+        num_bunkers = random.randint(1, 2)
+        for _ in range(num_bunkers):
+            bunker_x = random.uniform(150, base_distance - 60)
+            zones.append({
+                "type": "Bunker",
+                "x_start": bunker_x,
+                "x_end": bunker_x + 25,
+                "y_start": random.uniform(-20, 5),
+                "y_end": random.uniform(5, 25)
+            })
+        
+        # Possible water hazard
+        if random.random() < 0.3:
+            water_x = random.uniform(200, base_distance - 100)
+            zones.append({
+                "type": "Water",
+                "x_start": water_x,
+                "x_end": water_x + 40,
+                "y_start": random.uniform(-15, -5),
+                "y_end": random.uniform(5, 15)
+            })
+        
+        # Fringe
+        zones.append({
+            "type": "Fringe",
+            "x_start": base_distance - green_depth/2 - 6,
+            "x_end": base_distance + green_depth/2 + 6,
+            "y_start": -green_width/2 - 6,
+            "y_end": green_width/2 + 6
+        })
+        
+        wind_condition = WindCondition(random.uniform(0, 12), random.uniform(0, 360), random.uniform(0, 3))
+        
+        return EliteGolfHole(
+            length=base_distance, fairway_width=fairway_width,
+            green_distance=base_distance, green_depth=green_depth,
+            green_width=green_width, elevation=elevation,
+            zones=zones, par=par, pin_pos=(pin_x, pin_y),
+            ob_zones=[], water_zones=[z for z in zones if z.get("type") == "Water"],
+            wind_condition=wind_condition
+        )
+    
+    def _generate_advanced_hole(self):
+        """Generate challenging hole"""
+        base_distance = random.uniform(420, 500)
+        par = 4 if base_distance < 460 else 5
+        fairway_width = random.uniform(24, 35)
+        green_width = random.uniform(18, 25)
+        green_depth = random.uniform(22, 32)
+        elevation = random.uniform(-35, 35)
+        
+        # Challenging pin positions
+        if random.random() < 0.4:  # Tucked pin
+            pin_x = base_distance - green_depth/2 + green_depth * random.choice([0.15, 0.85])
+            pin_y = random.uniform(-green_width/2.2, green_width/2.2)
+        else:
+            pin_x = base_distance - green_depth/2 + green_depth * random.uniform(0.3, 0.7)
+            pin_y = random.uniform(-green_width/2.5, green_width/2.5)
+        
+        zones = []
+        
+        # Multiple strategic bunkers
+        num_bunkers = random.randint(2, 4)
+        for _ in range(num_bunkers):
+            bunker_x = random.uniform(140, base_distance - 40)
+            zones.append({
+                "type": "Bunker",
+                "x_start": bunker_x,
+                "x_end": bunker_x + random.uniform(20, 35),
+                "y_start": random.uniform(-25, 5),
+                "y_end": random.uniform(5, 30)
+            })
+        
+        # Water hazard
+        if random.random() < 0.6:
+            water_x = random.uniform(180, base_distance - 80)
+            zones.append({
+                "type": "Water",
+                "x_start": water_x,
+                "x_end": water_x + random.uniform(35, 55),
+                "y_start": random.uniform(-20, -5),
+                "y_end": random.uniform(5, 20)
+            })
+        
+        # Trees for strategic interest
+        if random.random() < 0.5:
+            tree_x = random.uniform(100, 250)
+            zones.append({
+                "type": "Tree",
+                "x_start": tree_x,
+                "x_end": tree_x + 35,
+                "y_start": random.choice([-45, 25]),
+                "y_end": random.choice([-20, 50])
+            })
+        
+        # Fringe
+        zones.append({
+            "type": "Fringe",
+            "x_start": base_distance - green_depth/2 - 6,
+            "x_end": base_distance + green_depth/2 + 6,
+            "y_start": -green_width/2 - 6,
+            "y_end": green_width/2 + 6
+        })
+        
+        # OB zones
+        ob_zones = [
+            {"x_start": 0, "x_end": base_distance + 15, "y_start": 45, "y_end": 100, "type": "OB"},
+            {"x_start": 0, "x_end": base_distance + 15, "y_start": -100, "y_end": -45, "type": "OB"}
+        ]
+        
+        wind_condition = WindCondition(random.uniform(0, 20), random.uniform(0, 360), random.uniform(0, 5))
+        
+        return EliteGolfHole(
+            length=base_distance, fairway_width=fairway_width,
+            green_distance=base_distance, green_depth=green_depth,
+            green_width=green_width, elevation=elevation,
+            zones=zones, par=par, pin_pos=(pin_x, pin_y),
+            ob_zones=ob_zones, water_zones=[z for z in zones if z.get("type") == "Water"],
+            wind_condition=wind_condition
+        )
+
+# ====== PERFORMANCE ANALYTICS ======
+class PerformanceAnalyzer:
+    def __init__(self):
+        self.episode_data = []
+        self.training_metrics = {
+            'loss_history': [],
+            'epsilon_history': [],
+            'reward_history': [],
+            'score_history': []
+        }
+    
+    def record_episode(self, episode_result, episode_num):
+        """Record episode data for analysis"""
+        data = {
+            'episode': episode_num,
+            'total_strokes': episode_result['total_strokes'],
+            'score_vs_par': episode_result['score_vs_par'],
+            'shots_to_green': episode_result['shots_to_green'],
+            'fairways_hit': episode_result['fairways_hit'],
+            'greens_in_regulation': episode_result['greens_in_regulation'],
+            'total_putts': episode_result['total_putts'],
+            'avg_reward': np.mean([s.get('reward', 0) for s in episode_result['shot_history']])
+        }
+        self.episode_data.append(data)
+    
+    def record_training_step(self, loss, epsilon, episode_reward, episode_score):
+        """Record training metrics"""
+        self.training_metrics['loss_history'].append(loss)
+        self.training_metrics['epsilon_history'].append(epsilon)
+        self.training_metrics['reward_history'].append(episode_reward)
+        self.training_metrics['score_history'].append(episode_score)
+    
+    def get_recent_performance(self, window=100):
+        """Get recent performance statistics"""
+        if len(self.episode_data) < window:
+            data = self.episode_data
+        else:
+            data = self.episode_data[-window:]
+        
+        if not data:
+            return {}
+        
+        scores = [d['score_vs_par'] for d in data]
+        strokes = [d['total_strokes'] for d in data]
+        
+        return {
+            'avg_score_vs_par': np.mean(scores),
+            'scoring_std': np.std(scores),
+            'avg_strokes': np.mean(strokes),
+            'sub_par_rate': len([s for s in scores if s < 0]) / len(scores),
+            'par_or_better_rate': len([s for s in scores if s <= 0]) / len(scores),
+            'double_bogey_plus_rate': len([s for s in scores if s >= 2]) / len(scores),
+            'avg_fairways_hit': np.mean([d['fairways_hit'] for d in data]),
+            'avg_gir': np.mean([d['greens_in_regulation'] for d in data]),
+            'avg_putts': np.mean([d['total_putts'] for d in data])
+        }
+    
+    def export_training_data(self, filename="elite_training_data.csv"):
+        """Export comprehensive training data"""
+        if not self.episode_data:
+            return
+        
+        df = pd.DataFrame(self.episode_data)
+        df.to_csv(filename, index=False)
+        print(f"Training data exported to {filename}")
+    
+    def print_performance_summary(self, window=100):
+        """Print detailed performance summary"""
+        stats = self.get_recent_performance(window)
+        if not stats:
+            print("No performance data available")
+            return
+        
+        print(f"\n=== PERFORMANCE SUMMARY (Last {window} episodes) ===")
+        print(f"Average Score vs Par: {stats['avg_score_vs_par']:.2f} ± {stats['scoring_std']:.2f}")
+        print(f"Average Total Strokes: {stats['avg_strokes']:.1f}")
+        print(f"Sub-par Rate: {stats['sub_par_rate']:.1%}")
+        print(f"Par or Better Rate: {stats['par_or_better_rate']:.1%}")
+        print(f"Double Bogey+ Rate: {stats['double_bogey_plus_rate']:.1%}")
+        print(f"Average Fairways Hit: {stats['avg_fairways_hit']:.1f}")
+        print(f"Average GIR: {stats['avg_gir']:.1%}")
+        print(f"Average Putts: {stats['avg_putts']:.1f}")
+        print("=" * 50)
+
+# ====== MAIN TRAINING SYSTEM ======
+def main_elite_training():
+    """Elite golf AI training system"""
+    print("=" * 60)
+    print("ELITE GOLF AI TRAINING SYSTEM")
+    print("=" * 60)
+    
+    # Initialize components
+    agent = EliteGolfAgent()
+    player = ElitePlayer(club_means, club_stds, lateral_stds, skill_level="tour_pro")
+    curriculum = CurriculumManager()
+    analyzer = PerformanceAnalyzer()
+    
+    # Training parameters
+    total_episodes = 50000
+    eval_frequency = 1000
+    save_frequency = 5000
+    
+    print(f"Training for {total_episodes} episodes...")
+    print(f"Using device: {agent.device}")
+    print(f"Action space size: {agent.get_action_space_size()}")
+    
+    # Training loop
+    for episode in range(total_episodes):
+        # Generate hole based on curriculum
+        hole = curriculum.generate_curriculum_hole()
+        
+        # Create game context
+        game_context = GameContext(
+            round_number=random.randint(1, 4),
+            hole_number=random.randint(1, 18),
+            current_score_vs_par=random.randint(-5, 5),
+            tournament_position=random.choice(['leading', 'contending', 'making_cut', 'missing_cut']),
+            pressure_level=random.uniform(0.0, 1.0),
+            confidence=player.confidence,
+            momentum=player.momentum
+        )
+        
+        # Run episode
+        episode_result = run_elite_episode(hole, agent, player, game_context)
+        
+        # Record performance
+        analyzer.record_episode(episode_result, episode)
+        curriculum.record_performance(episode_result['score_vs_par'])
+        
+        # Training step
+        if len(agent.memory) > agent.batch_size:
+            loss = agent.train_step()
+            if loss is not None:
+                episode_reward = sum(s.get('reward', 0) for s in episode_result['shot_history'])
+                analyzer.record_training_step(loss, agent.epsilon, episode_reward, episode_result['score_vs_par'])
+        
+        # Progress reporting
+        if (episode + 1) % 100 == 0:
+            recent_stats = analyzer.get_recent_performance(100)
+            if recent_stats:
+                print(f"Ep {episode + 1:5d} | "
+                      f"Score: {episode_result['score_vs_par']:+2d} | "
+                      f"Avg: {recent_stats['avg_score_vs_par']:+.1f} | "
+                      f"ε: {agent.epsilon:.3f} | "
+                      f"Level: {curriculum.get_current_level()['name']}")
+        
+        # Detailed evaluation
+        if (episode + 1) % eval_frequency == 0:
+            print(f"\n--- EVALUATION AT EPISODE {episode + 1} ---")
+            analyzer.print_performance_summary(eval_frequency)
+            
+            # Test on tour-level holes
+            print("\nTesting on Tour-Level Holes...")
+            test_scores = []
+            for _ in range(50):
+                test_hole = generate_elite_hole()
+                test_context = GameContext(
+                    round_number=4, hole_number=18,
+                    current_score_vs_par=0, tournament_position='contending',
+                    pressure_level=0.8, confidence=player.confidence, momentum=player.momentum
+                )
+                test_result = run_elite_episode(test_hole, agent, player, test_context)
+                test_scores.append(test_result['score_vs_par'])
+            
+            avg_test_score = np.mean(test_scores)
+            print(f"Tour-Level Test Average: {avg_test_score:+.2f}")
+            print(f"Tour-Level Par Rate: {len([s for s in test_scores if s <= 0]) / len(test_scores):.1%}")
+        
+        # Save model
+        if (episode + 1) % save_frequency == 0:
+            torch.save({
+                'episode': episode + 1,
+                'model_state_dict': agent.q_network.state_dict(),
+                'target_state_dict': agent.target_network.state_dict(),
+                'optimizer_state_dict': agent.optimizer.state_dict(),
+                'epsilon': agent.epsilon,
+                'curriculum_level': curriculum.current_level
+            }, f'elite_golf_model_ep{episode + 1}.pt')
+            print(f"Model saved at episode {episode + 1}")
+    
+    print("\n" + "=" * 60)
+    print("TRAINING COMPLETE!")
+    print("=" * 60)
+    
+    # Final evaluation
+    analyzer.print_performance_summary(2000)
+    analyzer.export_training_data()
+    
+    # Save final model
+    torch.save({
+        'episode': total_episodes,
+        'model_state_dict': agent.q_network.state_dict(),
+        'target_state_dict': agent.target_network.state_dict(),
+        'optimizer_state_dict': agent.optimizer.state_dict(),
+        'epsilon': agent.epsilon,
+        'curriculum_level': curriculum.current_level
+    }, 'elite_golf_model_final.pt')
+    
+    print("Final model saved as 'elite_golf_model_final.pt'")
+    return agent, analyzer
+
+if __name__ == "__main__":
+    # Run the elite training system
+    trained_agent, performance_analyzer = main_elite_training()

@@ -1,8 +1,18 @@
+# render.yaml
 services:
+  - type: web
+    name: golf-strategy-frontend
+    env: node
+    buildCommand: cd frontend && npm install && npm run build
+    startCommand: cd frontend && npm run start
+    envVars:
+      - key: PORT
+        value: 3000
+    plan: free
+
   - type: web
     name: golf-strategy-backend
     env: python
+    buildCommand: cd backend && pip install -r requirements.txt
+    startCommand: cd backend && python main.py
     plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn backend.main:app --host 0.0.0.0 --port 8000
-    envVars: []

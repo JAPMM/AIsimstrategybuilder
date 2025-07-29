@@ -10,3 +10,11 @@ def train_model(shot_data=None):
     # Now run full training loop (your model reads shot_logs_all.csv as pretraining)
     full_training_loop()
     return {"status": "Training complete (seeded with replay buffer)"}
+
+import json
+import os 
+
+def export_strategy_to_json(stroke_zones, hole_number=1):
+    export_path = f"../frontend/public/strategies/hole_{hole_number}_strategy.json
+    with open(export_path, "w") as f:
+        json.dump({"stroke_zones": stroke_zones }, f, indent=2)"
