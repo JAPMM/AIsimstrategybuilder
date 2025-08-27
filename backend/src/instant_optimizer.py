@@ -1,347 +1,216 @@
-import torch
-import numpy as np
-from typing import Dict, List, Tuple, Optional
-import pandas as pd
+"""
+instant_optimizer.py
+====================
 
-# Import your existing components
-from backend.your_previous_model import (
-    club_means, club_stds, lateral_stds, clubs_all, 
-    mode_encoding_map, classify_shot, Player
-)
+This module implements a lightweight optimisation engine for golf shots.
+Given a hole layout and a simple statistical model of the player's shot
+patterns, the optimizer produces actionable recommendations for the
+next shot.  It is intentionally pragmatic: rather than employing a
+computationally expensive reinforcement learning model it uses a set
+of heuristics derived from typical club distances and dispersion.
+
+The optimizer exposes three key methods used by the backend API:
+
+* :func:`get_optimal_shot` – return a single best recommendation for
+  the next shot given the current position and lie.
+* :func:`reoptimize_from_position` – recompute the optimal shot after
+  the ball has been moved (e.g. when the user drags the ball on the
+  front end).
+* :func:`get_shot_options` – return a ranked list of alternative shot
+  candidates for comparison.
+"""
+
+from __future__ import annotations
+
+import math
+import os
+import csv
+from typing import Dict, List, Tuple, Any
+
 
 class InstantGolfOptimizer:
-    def __init__(self, qnet, hole_data: Dict):
+    """Optimise golf shots based on simple heuristics."""
+
+    # Default club statistics (mean carry in yards, standard deviation of carry
+    # in yards, standard deviation of lateral dispersion in yards).  These
+    # values are approximations based on typical amateur distances and can be
+    # overridden by supplying a custom csv file named
+    # ``golf_shot_dispersion_summary.csv`` alongside this module.  The file
+    # should contain columns ``Club``, ``mean_carry``, ``std_carry`` and
+    # ``std_lateral``.
+    DEFAULT_CLUB_STATS: Dict[str, Tuple[float, float, float]] = {
+        "Driver": (250, 15, 20),
+        "3 Wood": (230, 15, 18),
+        "5 Wood": (215, 14, 17),
+        "3 Hybrid": (205, 12, 15),
+        "4 Iron": (195, 12, 13),
+        "5 Iron": (185, 11, 12),
+        "6 Iron": (175, 11, 11),
+        "7 Iron": (165, 10, 10),
+        "8 Iron": (155, 9, 9),
+        "9 Iron": (145, 9, 8),
+        "Pitching Wedge": (135, 8, 7),
+        "Gap Wedge": (120, 8, 6),
+        "Sand Wedge": (105, 7, 6),
+        "Lob Wedge": (90, 7, 5),
+    }
+
+    def __init__(self, qnet: Any, hole_data: Dict[str, Any]):
+        """Initialise with a (possibly dummy) Q‑network and hole layout."""
         self.qnet = qnet
-        self.qnet.eval()  # Set to evaluation mode
-        self.hole_data = hole_data
-        self.clubs_all = clubs_all
-        self.club_means = club_means
-        self.player = Player(club_means, club_stds, lateral_stds)
-        
-        # Pre-compute available clubs for speed
-        self.tee_clubs = [c for c in clubs_all if club_means[c] >= 180]
-        self.approach_clubs = [c for c in clubs_all if c != "Driver"]
-        
-    def get_optimal_shot(self, 
-                        distance_to_pin: float, 
-                        lateral_position: float, 
-                        shot_number: int = 1,
-                        lie_type: str = "Fairway",
-                        player_mode: str = "Normal") -> Dict:
+        self.hole = hole_data
+        self.club_stats = self._load_club_stats()
+        # Extract pin position from hole_data; fall back to end of hole length
+        pin_pos = hole_data.get("pin_position") or hole_data.get("pin_pos")
+        if pin_pos and isinstance(pin_pos, (list, tuple)) and len(pin_pos) >= 2:
+            self.pin_x, self.pin_y = pin_pos[0], pin_pos[1]
+        else:
+            # Use total hole length on x axis and 0 on y axis if unspecified
+            length = hole_data.get("yardage") or hole_data.get("length") or 0
+            self.pin_x, self.pin_y = length, 0
+
+    # ------------------------------------------------------------------
+    # Data loading
+    # ------------------------------------------------------------------
+    def _load_club_stats(self) -> Dict[str, Tuple[float, float, float]]:
+        """Load club dispersion statistics from a CSV if present.
+
+        Returns a dictionary mapping club names to a tuple of
+        (mean_carry, std_carry, std_lateral).  If the file cannot be
+        read the default hard coded values are returned.
         """
-        Instantly return optimal shot given current position
-        Uses trained Q-network for <10ms response time
+        filename = os.path.join(os.path.dirname(__file__), "..", "golf_shot_dispersion_summary.csv")
+        try:
+            if os.path.exists(filename):
+                stats: Dict[str, Tuple[float, float, float]] = {}
+                with open(filename, "r", encoding="utf-8") as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        club = row["Club"].strip()
+                        mean_carry = float(row.get("mean_carry", 0))
+                        std_carry = float(row.get("std_carry", 0))
+                        std_lateral = float(row.get("std_lateral", 0))
+                        stats[club] = (mean_carry, std_carry, std_lateral)
+                # If file contained at least one row, return
+                if stats:
+                    return stats
+        except Exception:
+            # Ignore failures and fall back to defaults
+            pass
+        return self.DEFAULT_CLUB_STATS.copy()
+
+    # ------------------------------------------------------------------
+    # Optimisation logic
+    # ------------------------------------------------------------------
+    def get_optimal_shot(
+        self,
+        distance_to_pin: float,
+        lateral_position: float = 0.0,
+        shot_number: int = 1,
+        lie_type: str = "Fairway",
+        player_mode: str = "Normal",
+    ) -> Dict[str, Any]:
+        """Return the single best shot recommendation.
+
+        A simple heuristic is used: we choose the club whose mean carry
+        distance most closely matches (but does not exceed) the current
+        distance to the pin, then adjust the aim to correct for lateral
+        deviation.  If the distance is shorter than our shortest club
+        distance we choose a wedge.  The returned dictionary includes
+        the selected club, the aim angle, and expected dispersion values.
         """
-        
-        # Get available clubs
-        available_clubs = self.tee_clubs if shot_number == 1 else self.approach_clubs
-        
-        # Encode player mode
-        mode_encoding = mode_encoding_map.get(player_mode, 2)
-        
-        best_qvalue = float('-inf')
-        best_shot = None
-        
-        # Evaluate all possible club/aim combinations
-        aim_options = [-15, -10, -5, 0, 5, 10, 15]
-        
-        with torch.no_grad():  # Disable gradients for inference speed
-            for club in available_clubs:
-                for aim in aim_options:
-                    # Encode state-action pair
-                    state_vector = self._encode_state_action(
-                        0, distance_to_pin, lateral_position, 
-                        shot_number, mode_encoding, club, aim
-                    )
-                    
-                    # Get Q-value prediction
-                    qvalue = self.qnet(torch.tensor(state_vector, dtype=torch.float32)).item()
-                    
-                    if qvalue > best_qvalue:
-                        best_qvalue = qvalue
-                        best_shot = {
-                            "club": club,
-                            "aim_point": aim,
-                            "confidence": self._qvalue_to_confidence(qvalue),
-                            "q_value": qvalue,
-                            "expected_outcome": self._predict_shot_outcome(
-                                club, aim, distance_to_pin, lateral_position, lie_type
-                            ),
-                            "strokes_gained": self._calculate_strokes_gained(qvalue, distance_to_pin)
-                        }
-        
-        return best_shot
-    
-    def get_shot_options(self, 
-                        distance_to_pin: float, 
-                        lateral_position: float, 
-                        shot_number: int = 1,
-                        top_n: int = 3) -> List[Dict]:
-        """Return top N shot options ranked by Q-value for strategy comparison"""
-        
-        available_clubs = self.tee_clubs if shot_number == 1 else self.approach_clubs
-        mode_encoding = 2  # Normal mode
-        
-        options = []
-        aim_options = [-15, -10, -5, 0, 5, 10, 15]
-        
-        with torch.no_grad():
-            for club in available_clubs:
-                for aim in aim_options:
-                    state_vector = self._encode_state_action(
-                        0, distance_to_pin, lateral_position, 
-                        shot_number, mode_encoding, club, aim
-                    )
-                    
-                    qvalue = self.qnet(torch.tensor(state_vector, dtype=torch.float32)).item()
-                    
-                    options.append({
-                        "club": club,
-                        "aim_point": aim,
-                        "q_value": qvalue,
-                        "confidence": self._qvalue_to_confidence(qvalue),
-                        "expected_outcome": self._predict_shot_outcome(
-                            club, aim, distance_to_pin, lateral_position, "Fairway"
-                        ),
-                        "strokes_gained": self._calculate_strokes_gained(qvalue, distance_to_pin),
-                        "risk_level": self._assess_risk_level(club, aim, distance_to_pin)
-                    })
-        
-        # Return top N options sorted by Q-value
-        return sorted(options, key=lambda x: x['q_value'], reverse=True)[:top_n]
-    
-    def reoptimize_from_position(self, 
-                               ball_x: float, 
-                               ball_y: float, 
-                               shot_number: int) -> Dict:
-        """
-        Instantly reoptimize strategy from new ball position
-        Called when user drags ball to new location
-        """
-        
-        # Calculate new distance to pin
-        pin_x, pin_y = self.hole_data['pin_position']
-        distance_to_pin = np.sqrt((ball_x - pin_x)**2 + (ball_y - pin_y)**2)
-        lateral_position = ball_y  # Assuming fairway centerline is y=0
-        
-        # Determine lie type based on position
-        lie_type = self._classify_lie_from_position(ball_x, ball_y)
-        
-        # Get optimal shot from new position
-        optimal_shot = self.get_optimal_shot(
-            distance_to_pin, lateral_position, shot_number, lie_type
-        )
-        
-        # Get alternative options
-        alternatives = self.get_shot_options(distance_to_pin, lateral_position, shot_number)
-        
-        return {
-            "current_position": {"x": ball_x, "y": ball_y},
-            "distance_to_pin": round(distance_to_pin, 1),
-            "lateral_position": round(lateral_position, 1),
+        # Compute absolute horizontal distance remaining
+        target_distance = max(distance_to_pin, 0.0)
+        # Determine best club
+        selected_club = self._choose_club(target_distance)
+        mean_carry, std_carry, std_lateral = self.club_stats[selected_club]
+        # Calculate recommended aim: attempt to compensate for current lateral position
+        # by aiming opposite the miss.  The aim is expressed in degrees left(-)/right(+).
+        aim_angle = 0.0
+        if std_lateral > 0:
+            aim_angle = -lateral_position / std_lateral * 5.0  # scale factor to convert yards to degrees
+            # Clamp aim angle to realistic range [-20, 20] degrees
+            aim_angle = max(min(aim_angle, 20.0), -20.0)
+        result = {
+            "club": selected_club,
+            "aim_angle_degrees": round(aim_angle, 1),
+            "expected_carry": mean_carry,
+            "expected_lateral_std": std_lateral,
+            "estimated_remaining_distance": max(target_distance - mean_carry, 0.0),
+            "shot_number": shot_number,
             "lie_type": lie_type,
-            "optimal_shot": optimal_shot,
-            "alternatives": alternatives[1:],  # Skip first (optimal) option
-            "course_strategy": self._get_strategy_context(distance_to_pin, shot_number)
         }
-    
-    def _encode_state_action(self, hole_idx, distance, lateral, shot_num, mode_encoding, club, aim):
-        """Same encoding as training - maintain consistency"""
-        club_onehot = [1 if club == c else 0 for c in self.clubs_all]
-        aim_norm = aim / 15
-        return [hole_idx, distance/500, lateral/50, shot_num/10, mode_encoding/4] + club_onehot + [aim_norm]
-    
-    def _qvalue_to_confidence(self, qvalue: float) -> float:
-        """Convert Q-value to confidence percentage (0-100)"""
-        # Normalize based on typical Q-value ranges from training
-        # Adjust these bounds based on your actual Q-value distribution
-        min_q, max_q = -15.0, 5.0
-        normalized = max(0, min(1, (qvalue - min_q) / (max_q - min_q)))
-        return round(normalized * 100, 1)
-    
-    def _predict_shot_outcome(self, club: str, aim: int, distance: float, lateral: float, lie: str) -> Dict:
-        """Predict expected outcome using same logic as training"""
-        
-        # Get base club performance
-        expected_carry = self.club_means[club]
-        carry_std = club_stds[club]
-        lateral_std = lateral_stds[club]
-        
-        # Adjust for lie conditions (same as training)
-        lie_adjustments = {
-            "Tee": {"carry_mult": 1.0, "std_mult": 1.0},
-            "Fairway": {"carry_mult": 1.0, "std_mult": 0.85},
-            "First Cut": {"carry_mult": 0.95, "std_mult": 0.95},
-            "Rough": {"carry_mult": 0.85, "std_mult": 1.05},
-            "Deep Rough": {"carry_mult": 0.75, "std_mult": 1.18},
-            "Bunker": {"carry_mult": 0.6, "std_mult": 1.2},
-            "Tree": {"carry_mult": 0.5, "std_mult": 2.0},
-            "Fringe": {"carry_mult": 0.95, "std_mult": 0.93}
-        }
-        
-        adj = lie_adjustments.get(lie, {"carry_mult": 1.0, "std_mult": 1.0})
-        adjusted_carry = expected_carry * adj["carry_mult"]
-        adjusted_std = carry_std * adj["std_mult"]
-        
-        # Calculate expected final position
-        remaining_distance = max(0, distance - adjusted_carry)
-        expected_lateral = lateral + aim
-        
-        return {
-            "carry_distance": round(adjusted_carry, 1),
-            "carry_std": round(adjusted_std, 1),
-            "remaining_distance": round(remaining_distance, 1),
-            "expected_lateral": round(expected_lateral, 1),
-            "success_probability": round(self._calculate_success_prob(club, distance, lie) * 100, 1),
-            "expected_strokes_from_result": self._estimate_strokes_from_position(
-                remaining_distance, abs(expected_lateral)
+        return result
+
+    def _choose_club(self, distance: float) -> str:
+        """Select the club whose mean carry is closest to the remaining distance.
+
+        Preference is given to clubs that will not grossly over‑carry the
+        target.  If all clubs overshoot, the one with the shortest mean
+        carry is chosen.
+        """
+        best_club = None
+        best_error = float("inf")
+        for club, (mean_carry, _, _) in self.club_stats.items():
+            error = abs(distance - mean_carry)
+            # Penalise overshoot by adding a large constant to the error
+            if mean_carry > distance:
+                error += 50
+            if error < best_error:
+                best_error = error
+                best_club = club
+        return best_club or list(self.club_stats.keys())[0]
+
+    def reoptimize_from_position(
+        self, ball_x: float, ball_y: float, shot_number: int
+    ) -> Dict[str, Any]:
+        """Recompute the optimal shot based on the ball's current coordinates.
+
+        The new distance to the pin is computed using Euclidean distance in
+        the 2D plane defined by x (downrange) and y (lateral).  The method
+        returns the same structure as :func:`get_optimal_shot`.
+        """
+        dx = self.pin_x - ball_x
+        dy = self.pin_y - ball_y
+        distance = math.sqrt(dx * dx + dy * dy)
+        lateral = dy  # lateral position relative to target line
+        return self.get_optimal_shot(distance, lateral, shot_number)
+
+    def get_shot_options(
+        self, distance_to_pin: float, lateral_position: float, shot_number: int, top_n: int = 3
+    ) -> List[Dict[str, Any]]:
+        """Return a ranked list of alternative shot options.
+
+        For each club we compute the absolute error between its mean carry
+        distance and the target distance.  The top ``n`` clubs with the
+        lowest error (overshoot penalty applied) are returned along with
+        recommended aim angles.  This function is useful for scenarios
+        where the user wants to compare options instead of taking the
+        single top recommendation.
+        """
+        candidates: List[Tuple[str, float]] = []
+        for club, (mean_carry, _, _) in self.club_stats.items():
+            error = abs(distance_to_pin - mean_carry)
+            if mean_carry > distance_to_pin:
+                error += 50
+            candidates.append((club, error))
+        # Sort by error
+        candidates.sort(key=lambda x: x[1])
+        options = []
+        for club, _ in candidates[: max(top_n, 1)]:
+            mean_carry, _, std_lateral = self.club_stats[club]
+            aim_angle = 0.0
+            if std_lateral > 0:
+                aim_angle = -lateral_position / std_lateral * 5.0
+                aim_angle = max(min(aim_angle, 20.0), -20.0)
+            options.append(
+                {
+                    "club": club,
+                    "aim_angle_degrees": round(aim_angle, 1),
+                    "expected_carry": mean_carry,
+                    "expected_lateral_std": std_lateral,
+                    "estimated_remaining_distance": max(distance_to_pin - mean_carry, 0.0),
+                    "shot_number": shot_number,
+                }
             )
-        }
-    
-    def _calculate_success_prob(self, club: str, distance: float, lie: str) -> float:
-        """Calculate probability of good outcome"""
-        expected_carry = self.club_means[club]
-        distance_diff = abs(expected_carry - distance)
-        
-        # Base probability based on club-distance match
-        if distance_diff < 10:
-            base_prob = 0.85
-        elif distance_diff < 20:
-            base_prob = 0.75
-        elif distance_diff < 30:
-            base_prob = 0.65
-        else:
-            base_prob = 0.5
-        
-        # Adjust for lie
-        lie_multipliers = {
-            "Tee": 1.0,
-            "Fairway": 0.95,
-            "First Cut": 0.85,
-            "Rough": 0.75,
-            "Deep Rough": 0.6,
-            "Bunker": 0.5,
-            "Tree": 0.4,
-            "Fringe": 0.9
-        }
-        
-        return base_prob * lie_multipliers.get(lie, 0.8)
-    
-    def _classify_lie_from_position(self, x: float, y: float) -> str:
-        """Determine lie type based on ball position and hole geometry"""
-        
-        # Use same classification logic as training
-        hole_dict = {
-            'green_distance': self.hole_data.get('green_distance', 400),
-            'green_depth': self.hole_data.get('green_depth', 25), 
-            'green_width': self.hole_data.get('green_width', 20),
-            'fairway_width': self.hole_data.get('fairway_width', 30),
-            'zones': self.hole_data.get('zones', []),
-            'ob_zones': self.hole_data.get('ob_zones', []),
-            'water_zones': self.hole_data.get('water_zones', [])
-        }
-        
-        # Create temporary hole object for classification
-        class TempHole:
-            def __init__(self, data):
-                for key, value in data.items():
-                    setattr(self, key, value)
-        
-        temp_hole = TempHole(hole_dict)
-        return classify_shot(temp_hole, x, y)
-    
-    def _calculate_strokes_gained(self, qvalue: float, distance_to_pin: float) -> float:
-        """Convert Q-value to strokes gained estimate"""
-        # This is an approximation - you might want to calibrate this
-        baseline_strokes = self._get_baseline_strokes(distance_to_pin)
-        
-        # Convert Q-value to strokes improvement
-        # Higher Q-value = fewer strokes expected
-        strokes_improvement = qvalue * 0.1  # Adjust multiplier based on your Q-value scale
-        
-        return round(strokes_improvement, 2)
-    
-    def _get_baseline_strokes(self, distance: float) -> float:
-        """Baseline strokes expected from distance (PGA tour averages)"""
-        if distance <= 3:
-            return 1.0
-        elif distance <= 10:
-            return 1.1
-        elif distance <= 25:
-            return 1.3
-        elif distance <= 50:
-            return 1.8
-        elif distance <= 100:
-            return 2.4
-        elif distance <= 150:
-            return 2.8
-        elif distance <= 200:
-            return 3.2
-        else:
-            return 3.5 + (distance - 200) * 0.01
-    
-    def _assess_risk_level(self, club: str, aim: int, distance: float) -> str:
-        """Assess risk level of shot choice"""
-        expected_carry = self.club_means[club]
-        distance_diff = abs(expected_carry - distance)
-        
-        # High risk if club doesn't match distance well
-        if distance_diff > 30:
-            return "High"
-        elif distance_diff > 15:
-            return "Medium" 
-        elif abs(aim) > 10:
-            return "Medium"  # Aggressive aim
-        else:
-            return "Low"
-    
-    def _estimate_strokes_from_position(self, distance: float, lateral_error: float) -> float:
-        """Estimate strokes needed from resulting position"""
-        base_strokes = self._get_baseline_strokes(distance)
-        
-        # Add penalty for lateral error
-        if lateral_error > 30:
-            base_strokes += 0.5
-        elif lateral_error > 15:
-            base_strokes += 0.2
-        
-        return round(base_strokes, 1)
-    
-    def _get_strategy_context(self, distance: float, shot_number: int) -> Dict:
-        """Provide strategic context for the shot"""
-        return {
-            "shot_type": self._categorize_shot(distance, shot_number),
-            "key_consideration": self._get_key_consideration(distance, shot_number),
-            "target_zone": self._get_target_zone(distance)
-        }
-    
-    def _categorize_shot(self, distance: float, shot_number: int) -> str:
-        """Categorize the type of shot"""
-        if shot_number == 1:
-            return "Tee Shot"
-        elif distance > 150:
-            return "Approach Shot"
-        elif distance > 50:
-            return "Short Iron"
-        elif distance > 20:
-            return "Wedge"
-        else:
-            return "Short Game"
-    
-    def _get_key_consideration(self, distance: float, shot_number: int) -> str:
-        """Get key strategic consideration"""
-        if shot_number == 1:
-            return "Position for approach shot"
-        elif distance > 100:
-            return "Hit the green"
-        else:
-            return "Get close to pin"
-    
-    def _get_target_zone(self, distance: float) -> str:
-        """Get recommended target zone"""
-        if distance > 150:
-            return "Center of green"
-        elif distance > 75:
-            return "Pin-high, safe side"
-        else:
-            return "Attack the pin"
+        return options
