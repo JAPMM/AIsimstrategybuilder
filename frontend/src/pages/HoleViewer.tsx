@@ -1,40 +1,76 @@
-import React, { useEffect, useState } from "react";
-import dynamic from "next/dynamic";
+// pages/HoleViewer.tsx
+// Displays a single hole using the Course3DViewer component.  It loads
+// hole data from the backend, requests an optimal shot and updates it
+// when the ball is moved.  Designed to be embedded in other pages.
 
-// Lazy-load Three.js canvas component to avoid SSR issues
-const Course3DViewer = dynamic(() => import("../components/Course3DViewer"), { ssr: false });
+import React, { useEffect, useState } from 'react';
+import { getHoleData, optimizeShot, reoptimizeShot } from '../lib/api';
+import Course3DViewer from '../components/Course3DViewer';
 
-export default function HoleViewer() {
-  const [strategy, setStrategy] = useState(null);
-  const [courseData, setCourseData] = useState(null);
+interface HoleViewerProps {
+  holeId: string;
+}
 
-  const [selectedHole, setSelectedHole] = useState(1);
+interface HoleData {
+  hole_id: string;
+  hole_number: number;
+  par?: number;
+  yardage?: number;
+  pin_position?: [number, number, number];
+}
 
-useEffect(() => {
-  fetch(`/strategies/hole_${selectedHole}_strategy.json`)
-    .then((res) => res.json())
-    .then((data) => setStrategy(data.stroke_zones));
+export default function HoleViewer({ holeId }: HoleViewerProps) {
+  const [holeData, setHoleData] = useState<HoleData | null>(null);
+  const [target, setTarget] = useState<any | null>(null);
+  const [ballPosition, setBallPosition] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  const [loading, setLoading] = useState<boolean>(true);
 
-  fetch("/sampleCourse.json")
-    .then((res) => res.json())
-    .then((data) => setCourseData(data));
-}, [selectedHole]);
-  <select onChange={(e) => setSelectedHole(Number(e.target.value))} className="p-2 mb-4">
-    {[...Array(18)].map((_, i) => (
-      <option key={i} value={i + 1}>
-        Hole {i + 1}
-      </option>
-    ))}
-  </select>
+  // Fetch hole data when hole changes
+  useEffect(() => {
+    setLoading(true);
+    getHoleData(holeId)
+      .then((data) => {
+        setHoleData(data);
+        setLoading(false);
+      })
+      .catch((err) => {
+        console.error(err);
+        setLoading(false);
+      });
+  }, [holeId]);
 
+  // Request the first shot when hole data is ready
+  useEffect(() => {
+    if (!holeData) return;
+    const dist = holeData.yardage ?? 0;
+    optimizeShot({
+      hole_id: holeId,
+      distance_to_pin: dist,
+      lateral_position: 0,
+      shot_number: 1,
+      lie_type: 'Fairway',
+      player_mode: 'Normal',
+    })
+      .then((res) => setTarget(res))
+      .catch((err) => console.error(err));
+  }, [holeData]);
 
+  // Handle ball movement and reoptimise
+  const handleBallMove = (x: number, y: number) => {
+    setBallPosition({ x, y });
+    reoptimizeShot({ hole_id: holeId, ball_x: x, ball_y: y, shot_number: 1 })
+      .then((res) => setTarget(res))
+      .catch((err) => console.error(err));
+  };
 
-
-  if (!strategy || !courseData) return <p>Loading viewer...</p>;
+  if (loading || !holeData || !target) return <p>Loading hole...</p>;
 
   return (
-    <div className="h-screen w-screen">
-      <Course3DViewer data={courseData} strategy={strategy} />
-    </div>
+    <Course3DViewer
+      holeData={holeData}
+      ballPosition={ballPosition}
+      target={target}
+      onBallMove={handleBallMove}
+    />
   );
 }

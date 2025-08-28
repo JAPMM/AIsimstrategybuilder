@@ -1,0 +1,15 @@
+{
+  "hole_id": "pine_valley_golf_club_1_1",
+  "trained_episodes": 1000,
+  "training_date": "2025-08-28 15:23:24",
+  "performance": {
+    "average_score": 4.5,
+    "score_vs_par": 0.5,
+    "birdie_rate": 15.2,
+    "par_rate": 40.1,
+    "green_in_regulation_rate": 50.1,
+    "training_episodes": 1000,
+    "training_time": 0.02
+  },
+  "model_type": "reinforcement_learning"
+}

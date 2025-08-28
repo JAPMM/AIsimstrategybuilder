@@ -1,0 +1,30 @@
+{
+  "course_id": "demo_course",
+  "course_name": "Demo Golf Course",
+  "holes": [
+    {
+      "hole_id": "demo_course_1",
+      "hole_number": 1,
+      "par": 4,
+      "yardage": 385,
+      "green_distance": 385,
+      "green_depth": 25,
+      "green_width": 22,
+      "fairway_width": 32,
+      "elevation": 0,
+      "pin_position": [
+        373,
+        0
+      ],
+      "zones": [
+        {
+          "type": "Bunker",
+          "x_start": 200,
+          "x_end": 230,
+          "y_start": -20,
+          "y_end": -5
+        }
+      ]
+    }
+  ]
+}

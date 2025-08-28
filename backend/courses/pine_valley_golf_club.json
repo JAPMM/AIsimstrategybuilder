@@ -1,0 +1,37 @@
+{
+  "course_id": "pine_valley_golf_club",
+  "course_name": "Pine Valley Golf Club",
+  "holes": [
+    {
+      "hole_number": 1,
+      "par": 4,
+      "yardage": 427,
+      "green_distance": 427,
+      "green_depth": 26,
+      "green_width": 23,
+      "fairway_width": 35,
+      "elevation": 8,
+      "pin_position": [
+        415,
+        -2
+      ],
+      "zones": [
+        {
+          "type": "Bunker",
+          "x_start": 180,
+          "x_end": 210,
+          "y_start": -25,
+          "y_end": -10
+        },
+        {
+          "type": "Bunker",
+          "x_start": 380,
+          "x_end": 410,
+          "y_start": 8,
+          "y_end": 20
+        }
+      ],
+      "hole_id": "pine_valley_golf_club_1"
+    }
+  ]
+}

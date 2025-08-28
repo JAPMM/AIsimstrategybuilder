@@ -1,162 +1,92 @@
 // components/Course3DViewer.tsx
-import React, { useMemo, useRef } from "react";
-import { Canvas, useThree } from "@react-three/fiber";
-import { OrbitControls } from "@react-three/drei";
-import * as THREE from "three";
-import AnimatedBallTrajectory from "./AnimatedBallTrajectory";
+// A very simple Three.js visualisation of a golf hole.  It shows a flat
+// ground plane, the pin, the current ball position, and the AI's
+// recommended landing zone.  The ball can be dragged to a new position
+// and the parent component is notified via the `onBallMove` callback.
 
-// === Types ===
-type CourseMesh = {
-  elevation_map: number[][];
-  terrain_map: number[][];
-  pin_position: [number, number, number];
-  wind: { speed: number; direction: number };
-};
+import React, { useRef, useState } from 'react';
+import { Canvas } from '@react-three/fiber';
+import { OrbitControls } from '@react-three/drei';
+import * as THREE from 'three';
 
-type Shot = {
-  start: [number, number, number];
-  carry: number;
-  lateral: number;
-  peakHeight?: number;
-};
+interface Course3DViewerProps {
+  holeData: any;
+  ballPosition: { x: number; y: number };
+  target: any;
+  onBallMove: (x: number, y: number) => void;
+}
 
-type StrokeZone = {
-  stroke_index: number;
-  zones: {
-    position: [number, number]; // [x, y] in grid coords
-    radius: number;
-    type: "ideal" | "miss" | "avoid";
-  }[];
-};
+export default function Course3DViewer({ holeData, ballPosition, target, onBallMove }: Course3DViewerProps) {
+  // Local state to track dragging
+  const [isDragging, setDragging] = useState(false);
+  const planeRef = useRef<THREE.Mesh>(null!);
+  const ballRef = useRef<THREE.Mesh>(null!);
 
-type Props = {
-  data: CourseMesh;
-  shot?: Shot;
-  strategy?: StrokeZone[];
-};
+  // Convert backend shot recommendation into target coordinates.  We
+  // assume that a positive expected carry moves the ball forward
+  // (increasing x) and that aim_angle_degrees approximates yards left
+  // or right for simplicity.
+  const targetX = ballPosition.x + (target?.expected_carry || 0);
+  const targetY = ballPosition.y + (target?.aim_angle_degrees || 0);
 
-// === Constants ===
-const TILE_SIZE = 1;
-
-const terrainColors = {
-  0: "#3e7c3e", // rough
-  1: "#4caf50", // fairway
-  2: "#88e088", // green
-  3: "#c2b280", // bunker
-  4: "#4c84ff", // water
-  5: "#999999", // OB
-};
-
-const zoneColors = {
-  ideal: "#00ff00",
-  miss: "#2196f3",
-  avoid: "#ff1744"
-};
-
-// === Component ===
-export default function Course3DViewer({ data, shot, strategy }: Props) {
-  const { elevation_map, terrain_map, pin_position } = data;
-  const gridX = elevation_map.length;
-  const gridY = elevation_map[0].length;
-  const cameraFollowRef = useRef<THREE.Vector3>(new THREE.Vector3());
-
-  // === Camera Follow Logic ===
-  const { camera } = useThree();
-  const handlePositionUpdate = (pos: THREE.Vector3) => {
-    cameraFollowRef.current.copy(pos);
-    camera.position.lerp(new THREE.Vector3(pos.x + 10, pos.y - 30, pos.z + 15), 0.1);
-    camera.lookAt(pos);
+  // Event handlers for dragging the ball
+  const onPointerDown = (event: any) => {
+    event.stopPropagation();
+    setDragging(true);
+  };
+  const onPointerUp = (event: any) => {
+    event.stopPropagation();
+    if (isDragging) {
+      setDragging(false);
+      // Notify parent of new ball position
+      const [x, y] = event.point;
+      onBallMove(x, y);
+    }
+  };
+  const onPointerMove = (event: any) => {
+    if (!isDragging) return;
+    event.stopPropagation();
+    // Update ball position visually during drag
+    const [x, y] = event.point;
+    if (ballRef.current) ballRef.current.position.set(x, y, 0.2);
   };
 
-  // === Terrain Geometry ===
-  const terrainGeometry = useMemo(() => {
-    const geometry = new THREE.BufferGeometry();
-    const vertices: number[] = [];
-    const colors: number[] = [];
-    const indices: number[] = [];
-
-    for (let x = 0; x < gridX - 1; x++) {
-      for (let y = 0; y < gridY - 1; y++) {
-        const getColor = (terrainCode: number) =>
-          new THREE.Color(terrainColors[terrainCode as keyof typeof terrainColors]);
-
-        const points = [
-          [x, y],
-          [x + 1, y],
-          [x, y + 1],
-          [x + 1, y + 1]
-        ];
-
-        const idxBase = vertices.length / 3;
-
-        points.forEach(([i, j]) => {
-          vertices.push(i * TILE_SIZE, j * TILE_SIZE, elevation_map[i][j] * 10);
-          const color = getColor(terrain_map[i][j]);
-          colors.push(color.r, color.g, color.b);
-        });
-
-        indices.push(idxBase, idxBase + 1, idxBase + 2);
-        indices.push(idxBase + 1, idxBase + 3, idxBase + 2);
-      }
-    }
-
-    geometry.setAttribute("position", new THREE.Float32BufferAttribute(vertices, 3));
-    geometry.setAttribute("color", new THREE.Float32BufferAttribute(colors, 3));
-    geometry.setIndex(indices);
-    geometry.computeVertexNormals();
-
-    return geometry;
-  }, [elevation_map, terrain_map]);
-
   return (
-    <Canvas camera={{ position: [20, -80, 80], fov: 50 }}>
-      <ambientLight />
-      <directionalLight position={[50, 50, 100]} intensity={0.8} />
-
-      {/* Terrain */}
-      <mesh geometry={terrainGeometry}>
-        <meshStandardMaterial vertexColors={true} side={THREE.DoubleSide} />
-      </mesh>
-
-      {/* Pin */}
-      <mesh position={[
-        pin_position[0] * TILE_SIZE,
-        pin_position[1] * TILE_SIZE,
-        pin_position[2] * 10 + 1
-      ]}>
-        <sphereGeometry args={[0.6, 16, 16]} />
-        <meshStandardMaterial color="red" />
-      </mesh>
-
-      {/* Strategy Zones */}
-      {strategy?.map(({ stroke_index, zones }) =>
-        zones.map((zone, i) => (
-          <mesh
-            key={`zone-${stroke_index}-${i}`}
-            position={[zone.position[0], zone.position[1], 0.5]}
-          >
-            <cylinderGeometry args={[zone.radius, zone.radius, 0.2, 32]} />
-            <meshStandardMaterial
-              color={zoneColors[zone.type]}
-              transparent
-              opacity={zone.type === "avoid" ? 0.3 : 0.5}
-            />
+    <div style={{ height: 500, border: '1px solid #ccc' }}>
+      <Canvas camera={{ position: [holeData.yardage ?? 150, -80, 80], fov: 45 }}>
+        {/* Ground plane */}
+        <mesh ref={planeRef} rotation={[-Math.PI / 2, 0, 0]} onPointerDown={onPointerDown} onPointerUp={onPointerUp} onPointerMove={onPointerMove}>
+          <planeGeometry args={[holeData.yardage ? holeData.yardage * 2 : 200, 200]} />
+          <meshStandardMaterial color='#228B22' />
+        </mesh>
+        {/* Pin flag */}
+        <mesh position={[holeData.yardage ?? 100, 0, 0]}>
+          <coneGeometry args={[1, 5, 8]} />
+          <meshStandardMaterial color='red' />
+        </mesh>
+        {/* Ball */}
+        <mesh
+          ref={ballRef}
+          position={[ballPosition.x, ballPosition.y, 0.5]}
+          onPointerDown={onPointerDown}
+          onPointerUp={onPointerUp}
+          onPointerMove={onPointerMove}
+        >
+          <sphereGeometry args={[1, 32, 32]} />
+          <meshStandardMaterial color='white' />
+        </mesh>
+        {/* AI target marker */}
+        {target && (
+          <mesh position={[targetX, targetY, 0.3]}>
+            <sphereGeometry args={[1.5, 32, 32]} />
+            <meshStandardMaterial color='green' opacity={0.5} transparent />
           </mesh>
-        ))
-      )}
-
-      {/* Animated Shot */}
-      {shot && (
-        <AnimatedBallTrajectory
-          start={shot.start}
-          carry={shot.carry}
-          lateral={shot.lateral}
-          peakHeight={shot.peakHeight || 12}
-          onPositionUpdate={handlePositionUpdate}
-        />
-      )}
-
-      <OrbitControls />
-    </Canvas>
+        )}
+        {/* Lighting and controls */}
+        <ambientLight intensity={0.6} />
+        <directionalLight position={[50, 50, 50]} intensity={0.5} />
+        <OrbitControls />
+      </Canvas>
+    </div>
   );
 }
